@@ -218,7 +218,7 @@ ticket_agent = Agent(
     output_type=FinalScore,
 )
 
-def judge_response(inputs, output):
+def judge_response(span):
     """
     Evaluate the accuracy of effort rationale using an AI judge for inline evaluation.
     
@@ -234,6 +234,9 @@ def judge_response(inputs, output):
         Dict[str, int]: Dictionary with evaluation metric:
                        {"eng_effort_accuracy": rating} where rating is 1-5
     """
+    mlflow.openai.autolog(disable=True)
+    inputs = span.inputs
+    output = span.outputs
     request_description = inputs['ticket']['description']
     effort_rationale = output['final_score']['effort_rationale']
     client = OpenAI()
@@ -300,28 +303,37 @@ async def prioritize_features(input_csv: str, output_csv: str, customers_csv: st
             raise
 
 
-    mlflow.set_experiment("feature_requests_prioritization_oai_inline")
     with DominoRun(ai_system_config_path=CONFIG_PATH) as run:
         results = await asyncio.gather(*[prioritize_ticket(t) for t in tickets])
 
     df_out = pd.DataFrame(
-        [
-            {
-                "final_score": r.final_score.final_score,
-                "alignment_rationale": r.final_score.alignment_rationale,
-                "effort_rationale": r.final_score.effort_rationale,
-                "ticket_id": r.ticket_id,
-                "trace_id": r.trace_id,
-            }
-            for r in results
-        ]
+    	[
+    		{
+    			"ticket_id": r.ticket_id,
+    			"final_score": r.final_score.final_score,
+    			"alignment_rationale": r.final_score.alignment_rationale,
+    			"effort_rationale": r.final_score.effort_rationale,
+    			"trace_id": r.trace_id,
+    		}
+    		for r in results
+    	]
     )
 
     df_merged = df_out.merge(df[['description', 'ticket_id']], how="inner", on='ticket_id')
+    # Reorder columns to required schema
+    df_merged = df_merged[[
+        "ticket_id",
+        "description",
+        "final_score",
+        "alignment_rationale",
+        "effort_rationale",
+        "trace_id",
+    ]]
     df_merged.to_csv(output_csv, index=False)
 
 if __name__ == '__main__':
     base = os.path.dirname(__file__)
+    mlflow.set_experiment("feature_requests_prioritization_oai")
     INPUT_TICKETS = os.path.join(base, 'feature_requests.csv')
     SCORED_TICKETS = os.path.join(base, 'scored_tickets.csv')
     asyncio.run(prioritize_features(

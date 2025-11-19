@@ -5,20 +5,22 @@ import pandas as pd
 import logging
 import yaml
 from typing import List, Literal, Dict, Any
-from agents import Agent, Runner, function_tool, TResponseInputItem
+from agents import Agent, Runner, function_tool, TResponseInputItem, OpenAIChatCompletionsModel
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 from domino.aisystems.tracing import add_tracing, search_traces
 from domino.aisystems.logging import DominoRun, log_evaluation
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+import requests
 import mlflow
 import time
 import random
 from openai import OpenAI
 
-# Load environment variables
-dotenv_path = os.getenv('DOTENV_PATH') or None
-load_dotenv(override=True)
+# Load URL and API Key for LLM Endpoint
+BASE_URL = "https://genai42demo.engineering-dev.domino.tech/endpoints/qwen3-local/v1"
+API_KEY = requests.get("http://localhost:8899/access-token").text
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
 
 # Load configuration from YAML
@@ -60,9 +62,10 @@ class FinalScore(BaseModel):
     alignment_rationale: str
     effort_rationale: str
 
-class ScoredTicket(BaseModel):
+class TraceScore(BaseModel):
     ticket_id: int
     final_score: FinalScore
+    trace_id: str
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
@@ -188,20 +191,21 @@ def final_score_fn(reach: int, impact: int, align: int, effort: int) -> float:
     return score
 
 # ── AI Sub-Agents ──────────────────────────────────────────────────────────────
+LOCAL_MODEL = os.getenv('MODEL', config['models']['local'])
 MODEL = os.getenv('MODEL', config['models']['default'])
 ALT_MODEL = config['models']['agent']
 
 effort_agent = Agent(
     name="EffortAgent",
     instructions=config['instructions']['effort_agent'],
-    model=ALT_MODEL,
+    model=OpenAIChatCompletionsModel(model=LOCAL_MODEL, openai_client=client),
     output_type=EffortResult,
 )
 
 alignment_agent = Agent(
     name="AlignmentAgent",
     instructions=config['instructions']['alignment_agent'],
-    model=ALT_MODEL,
+    model=OpenAIChatCompletionsModel(model=LOCAL_MODEL, openai_client=client),
     output_type=AlignmentResult,
 )
 
@@ -210,76 +214,81 @@ instructions = prompt_with_handoff_instructions(config['instructions']['ticket_a
 ticket_agent = Agent(
     name="TicketPrioritizationAgent",
     instructions=instructions,
-    model=ALT_MODEL,
+    model=OpenAIChatCompletionsModel(model=LOCAL_MODEL, openai_client=client),
     tools=[reach_score_fn, impact_score_fn, final_score_fn, 
            effort_agent.as_tool(tool_name="evaluate_effort", tool_description="Evaluate implementation effort"), 
            alignment_agent.as_tool(tool_name="evaluate_alignment", tool_description="Evaluate strategic alignment")],
     output_type=FinalScore,
 )
 
-@add_tracing(name="prioritize_ticket", autolog_frameworks=["openai"])
-async def prioritize_ticket(ticket: TicketRecord) -> ScoredTicket:
-    
-    try:
-        inputs: list[TResponseInputItem] = [{"content": f"This is the ticket: {ticket.model_dump()}", "role": "user"}]
-        run_result = await Runner.run(ticket_agent, inputs)
-        
-        # Extract the typed output from the RunResult
-        final_score: FinalScore = run_result.final_output  # should be FinalScore instance
-        return ScoredTicket(
-            ticket_id=ticket.ticket_id,
-            final_score=final_score
-        )
-        
-    except Exception as e:
-        final_score = FinalScore(
-            final_score=0.0,
-            alignment_rationale=str(e),
-            effort_rationale=str(e),
-        )
-        
-        return ScoredTicket(
-            ticket_id=ticket.ticket_id,
-            final_score=final_score
-        )
-
-def judge_response(effort_rationale, request_description):
+def judge_response(span):
     """
-    Evaluate the accuracy of effort rationale using an AI judge.
+    Evaluate the accuracy of effort rationale using an AI judge for inline evaluation.
     
-    Uses an AI model to assess how well the effort rationale aligns with
-    the feature request description. This provides automated quality assessment
-    of the effort estimation process.
+    This function is used as an inline evaluator that automatically assesses
+    the quality of effort estimations during trace execution. It extracts
+    the effort rationale and request description from the trace data.
     
     Args:
-        effort_rationale (str): The rationale provided by the effort agent
-        request_description (str): Original feature request description
+        inputs (dict): Trace input data containing ticket information
+        output: Trace output data containing agent responses
         
     Returns:
-        int: Rating from 1-5 where:
-             - 5: Accurate and reasonable effort assessment
-             - 1: Significant over/underestimation of effort
+        Dict[str, int]: Dictionary with evaluation metric:
+                       {"eng_effort_accuracy": rating} where rating is 1-5
     """
-    client = OpenAI()
+    mlflow.openai.autolog(disable=True)
+    inputs = span.inputs
+    output = span.outputs
+    request_description = inputs['ticket']['description']
+    effort_rationale = output['final_score']['effort_rationale']
+    # client = OpenAI()
     judge_prompt = config['instructions']['judge_prompt'].format(
         effort_rationale=effort_rationale,
         request_description=request_description
     )
 
     completion = client.chat.completions.create(
-        model=config['models']['judge'],
+        model=config['models']['local_judge'],
         messages=[
             {"role": "user", "content": judge_prompt}
         ]
     )
     rating = int(completion.choices[0].message.content)
-    return rating
+    return {"eng_effort_accuracy": rating}
+
+@add_tracing(name="prioritize_ticket", autolog_frameworks=["openai"], evaluator=judge_response)
+async def prioritize_ticket(ticket: TicketRecord) -> TraceScore:
+    
+    try:
+        inputs: list[TResponseInputItem] = [{"content": f"This is the ticket: {ticket.model_dump()}", "role": "user"}]
+        run_result = await Runner.run(ticket_agent, inputs)
+        
+        # Extract the typed output from the RunResult
+        final: FinalScore = run_result.final_output  # should be FinalScore instance
+        trace_score: TraceScore = TraceScore(
+            ticket_id=ticket.ticket_id,
+            final_score=final,
+            trace_id=mlflow.get_active_trace_id()
+        )
+        return trace_score
+        
+    except Exception as e:
+        final = FinalScore(
+            final_score=0.0,
+            alignment_rationale=str(e),
+            effort_rationale=str(e),
+        )
+        return TraceScore(
+            ticket_id=0,
+            final_score=final,
+            trace_id='0'
+        )
 
 # ── Main ────────────────────────────────────────────────────────────────────────
 async def prioritize_features(input_csv: str, output_csv: str, customers_csv: str):
     
     df = pd.read_csv(input_csv)
-
     global arr_map_global
     arr_map_global = load_arr_map(customers_csv)
 
@@ -300,39 +309,38 @@ async def prioritize_features(input_csv: str, output_csv: str, customers_csv: st
     with DominoRun(ai_system_config_path=CONFIG_PATH) as run:
         results = await asyncio.gather(*[prioritize_ticket(t) for t in tickets])
 
-        # Run the evaluation, disable autologging so that we don't log traces associated with the LLM judge
-        mlflow.openai.autolog(disable=True)
-        
-        traces = search_traces(run_id=run.info.run_id)
-        for trace in traces.data:
-            effort_rationale = trace.spans[0].outputs['final_score']['effort_rationale']
-            request_description = trace.spans[0].inputs['ticket']['description']
-            score = judge_response(effort_rationale=effort_rationale, request_description=request_description)
-            print(trace.id)
-            log_evaluation(trace_id=trace.id, name="eng_effort_accuracy", value=score)
-
     df_out = pd.DataFrame(
         [
             {
+                "ticket_id": r.ticket_id,
                 "final_score": r.final_score.final_score,
                 "alignment_rationale": r.final_score.alignment_rationale,
                 "effort_rationale": r.final_score.effort_rationale,
-                "ticket_id": r.ticket_id
+                "trace_id": r.trace_id,
             }
             for r in results
         ]
     )
 
     df_merged = df_out.merge(df[['description', 'ticket_id']], how="inner", on='ticket_id')
+    df_merged = df_merged[[
+        "ticket_id",
+        "description",
+        "final_score",
+        "alignment_rationale",
+        "effort_rationale",
+        "trace_id",
+    ]]
     df_merged.to_csv(output_csv, index=False)
 
 if __name__ == '__main__':
     base = os.path.dirname(__file__)
     mlflow.set_experiment("feature_requests_prioritization_oai")
-    asyncio.run(
-        prioritize_features(
-            input_csv=os.path.join(base, 'feature_requests.csv'),
-            output_csv=os.path.join(base, 'scored_tickets.csv'),
+    INPUT_TICKETS = os.path.join(base, 'feature_requests.csv')
+    SCORED_TICKETS = os.path.join(base, 'scored_tickets.csv')
+    asyncio.run(prioritize_features(
+            input_csv=INPUT_TICKETS,
+            output_csv=SCORED_TICKETS,
             customers_csv=os.path.join(base, 'customers.csv'),
         )
     )
