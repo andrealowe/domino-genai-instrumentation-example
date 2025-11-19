@@ -4,7 +4,7 @@ pandas
 python-dotenv
 openai
 openai-agents
-PyYAML
 strands-agents
 strands-agents-tools
 streamlit
+PyYAML
